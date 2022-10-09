@@ -6,64 +6,218 @@
  * Minimal example to apply sigmoid activation on a tensor 
  * using cuDNN.
  **/
+
+#define checkCUDNN(expression)                               \
+  {                                                          \
+    cudnnStatus_t status = (expression);                     \
+    if (status != CUDNN_STATUS_SUCCESS) {                    \
+      std::cerr << "Error on line " << __LINE__ << ": "      \
+                << cudnnGetErrorString(status) << std::endl; \
+      std::exit(EXIT_FAILURE);                               \
+    }                                                        \
+  }
+
+
 int main(int argc, char** argv)
 {    
-    int numGPUs;
-    cudaGetDeviceCount(&numGPUs);
-    std::cout << "Found " << numGPUs << " GPUs." << std::endl;
-    cudaSetDevice(0); // use GPU0
-    int device; 
-    struct cudaDeviceProp devProp;
-    cudaGetDevice(&device);
-    cudaGetDeviceProperties(&devProp, device);
-    std::cout << "Compute capability:" << devProp.major << "." << devProp.minor << std::endl;
+    cudnnHandle_t cudnn;
+    cudnnCreate(&cudnn);
+    checkCUDNN(cudnnCreate(&cudnn));
+    cudnnTensorDescriptor_t input_descriptor;
+    checkCUDNN(cudnnCreateTensorDescriptor(&input_descriptor));
 
-    cudnnHandle_t handle_;
-    cudnnCreate(&handle_);
-    std::cout << "Created cuDNN handle" << std::endl;
 
-    // create the tensor descriptor
-    cudnnDataType_t dtype = CUDNN_DATA_FLOAT;
-    cudnnTensorFormat_t format = CUDNN_TENSOR_NCHW;
-    int n = 1, c = 1, h = 1, w = 10;
-    int NUM_ELEMENTS = n*c*h*w;
-    cudnnTensorDescriptor_t x_desc;
-    cudnnCreateTensorDescriptor(&x_desc);
-    cudnnSetTensor4dDescriptor(x_desc, format, dtype, n, c, h, w);
+    checkCUDNN(cudnnSetTensor4dDescriptor(input_descriptor,
+                                      /*format=*/CUDNN_TENSOR_NCHW,
+                                      /*dataType=*/CUDNN_DATA_FLOAT,
+                                      /*batch_size=*/1,
+                                      /*channels=*/256,
+                                      /*image_height=*/22,
+                                      /*image_width=*/22));
 
-    // create the tensor
-    float *x;
-    cudaMallocManaged(&x, NUM_ELEMENTS * sizeof(float));
-    for(int i=0;i<NUM_ELEMENTS;i++) x[i] = i * 1.00f;
-    std::cout << "Original array: "; 
-    for(int i=0;i<NUM_ELEMENTS;i++) std::cout << x[i] << " ";
+    cudnnTensorDescriptor_t output_descriptor;
+    checkCUDNN(cudnnCreateTensorDescriptor(&output_descriptor));
+    checkCUDNN(cudnnSetTensor4dDescriptor(output_descriptor,
+                                        /*format=*/CUDNN_TENSOR_NCHW,
+                                        /*dataType=*/CUDNN_DATA_FLOAT,
+                                        /*batch_size=*/1,
+                                        /*channels=*/10,
+                                        /*image_height=*/19,
+                                        /*image_width=*/19));
 
-    // create activation function descriptor
-    float alpha[1] = {1};
-    float beta[1] = {0.0};
-    cudnnActivationDescriptor_t sigmoid_activation;
-    cudnnActivationMode_t mode = CUDNN_ACTIVATION_SIGMOID;
-    cudnnNanPropagation_t prop = CUDNN_NOT_PROPAGATE_NAN;
-    cudnnCreateActivationDescriptor(&sigmoid_activation);
-    cudnnSetActivationDescriptor(sigmoid_activation, mode, prop, 0.0f);
 
-    cudnnActivationForward(
-        handle_,
-        sigmoid_activation,
-        alpha,
-        x_desc,
-        x,
-        beta,
-        x_desc,
-        x
-    );
+    cudnnFilterDescriptor_t kernel_descriptor;
+    checkCUDNN(cudnnCreateFilterDescriptor(&kernel_descriptor));
+    checkCUDNN(cudnnSetFilter4dDescriptor(kernel_descriptor,
+                                        /*dataType=*/CUDNN_DATA_FLOAT,
+                                        /*format=*/CUDNN_TENSOR_NCHW,
+                                        /*out_channels=*/10,
+                                        /*in_channels=*/256,
+                                        /*kernel_height=*/4,
+                                        /*kernel_width=*/4));
+    
+    cudnnConvolutionDescriptor_t convolution_descriptor;
+    checkCUDNN(cudnnCreateConvolutionDescriptor(&convolution_descriptor));
+    checkCUDNN(cudnnSetConvolution2dDescriptor(convolution_descriptor,
+                                            /*pad_height=*/0,
+                                            /*pad_width=*/0,
+                                            /*vertical_stride=*/1,
+                                            /*horizontal_stride=*/1,
+                                            /*dilation_height=*/1,
+                                            /*dilation_width=*/1,
+                                            /*mode=*/CUDNN_CONVOLUTION, // TODO: it may need change ... 
+                                            /*computeType=*/CUDNN_DATA_FLOAT));
 
-    cudnnDestroy(handle_);
-    std::cout << std::endl << "Destroyed cuDNN handle." << std::endl;
-    std::cout << "New array: ";
-    for(int i=0;i<NUM_ELEMENTS;i++) std::cout << x[i] << " ";
-    std::cout << std::endl;
-    cudaFree(x);
+
+    cudnnConvolutionFwdAlgoPerf_t convolution_algorithm;
+
+    int returnedAlgoCount = 1;
+    cudnnGetConvolutionForwardAlgorithmMaxCount(cudnn, &returnedAlgoCount);
+    checkCUDNN(
+    cudnnFindConvolutionForwardAlgorithm(/* cudnnHandle_t handle */ cudnn,
+                                        /* const cudnnTensorDescriptor_t xDesc */input_descriptor,
+                                        /* const cudnnFilterDescriptor_t wDesc */ kernel_descriptor,
+                                        /* const cudnnConvolutionDescriptor_t convDesc */convolution_descriptor,
+                                        /* const cudnnTensorDescriptor_t yDesc */output_descriptor,
+                                        /* const int requestedAlgoCoun */1,
+                                        /* int *returnedAlgoCount */&returnedAlgoCount,
+                                        /* cudnnConvolutionFwdAlgoPerf_t *perfResults */ &convolution_algorithm) );
+
+    size_t workspace_bytes = 0;
+
+    int n;
+    int c;
+    int h;
+    int w;
+
+    checkCUDNN(
+    cudnnGetConvolution2dForwardOutputDim(
+    /* const cudnnConvolutionDescriptor_t  convDesc */ convolution_descriptor,
+    /* const cudnnTensorDescriptor_t       inputTensorDesc */input_descriptor,
+    /* const cudnnFilterDescriptor_t       filterDesc */kernel_descriptor,
+    &n,
+    &c,
+    &h,
+    &w));
+
+    std::cout<<n<<"\t"<<c<<"\t"<<h<<"\t"<<w<<"\n";
+
+
+
+    cudnnGetConvolutionForwardWorkspaceSize(/* cudnnHandle_t handle */cudnn,
+                                        /* const cudnnTensorDescriptor_t xDesc */input_descriptor,
+                                        /* const cudnnFilterDescriptor_t wDesc */kernel_descriptor,
+                                        /* const cudnnConvolutionDescriptor_t convDesc */convolution_descriptor,
+                                        /* const cudnnTensorDescriptor_t yDesc */output_descriptor,
+                                        /* cudnnConvolutionFwdAlgo_t algo */
+                                        // convolution_algorithm.algo,
+                                        CUDNN_CONVOLUTION_FWD_ALGO_GEMM,
+                                        /* size_t *sizeInBytes */&workspace_bytes);
+
+/*     typedef enum {
+    CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM         = 0,
+    CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM = 1,
+    CUDNN_CONVOLUTION_FWD_ALGO_GEMM                  = 2,
+    CUDNN_CONVOLUTION_FWD_ALGO_DIRECT                = 3,
+    CUDNN_CONVOLUTION_FWD_ALGO_FFT                   = 4,
+    CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING            = 5,
+    CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD              = 6,
+    CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED     = 7,
+    CUDNN_CONVOLUTION_FWD_ALGO_COUNT                 = 8
+} cudnnConvolutionFwdAlgo_t;
+ */
+    std::cerr << "Workspace size: " << (workspace_bytes / 1048576.0) << "MB"
+            << std::endl;
+
+    void* d_workspace{nullptr};
+    cudaMalloc(&d_workspace, workspace_bytes);
+
+    int input_bytes = 1 * 256 * 22 * 22 * sizeof(float);
+
+    float* d_input{nullptr};
+    cudaMalloc(&d_input, input_bytes);
+
+    // cudaMemset(d_input, 1.0f, input_bytes);
+    float* h_input = new float[256 * 22 * 22];
+    for(int i = 0;i<256 * 22 * 22;i++) h_input[i] = 1.0f;
+    cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice);
+
+    int output_bytes = 1 * 10 * 19 * 19 * sizeof(float);
+    float* d_output{nullptr};
+    cudaMalloc(&d_output, output_bytes);
+    // cudaMemset(d_output, 0.0f, output_bytes);
+
+    float* d_kernel{nullptr};
+    cudaMalloc(&d_kernel, 10*256*4*4*sizeof(float));
+    float* h_kernel = new float[10*256*4*4];
+    for(int i = 0;i<10*256*4*4;i++) h_kernel[i] = 1.0f;
+    // cudaMemset(d_kernel, 1.0f, 10*256*4*4*sizeof(float));
+    cudaMemcpy(d_kernel, h_kernel, 10*256*4*4*sizeof(float), cudaMemcpyHostToDevice);
+
+
+    const float alpha = 1, beta = 0;
+    /* Convolution functions: All of the form "output = alpha * Op(inputs) + beta * output" */
+
+    /* Function to perform the forward pass for batch convolution */
+    checkCUDNN(
+    cudnnConvolutionForward(/* cudnnHandle_t handle */cudnn,
+                            /* const void *alpha */&alpha,
+                            /* const cudnnTensorDescriptor_t xDesc */input_descriptor,
+                            /* const void *x */d_input,
+                            /* const cudnnFilterDescriptor_t wDesc */kernel_descriptor,
+                            /* const void *w */d_kernel,
+                            /* const cudnnConvolutionDescriptor_t convDesc */convolution_descriptor,
+                            /* cudnnConvolutionFwdAlgo_t algo */
+                            // convolution_algorithm.algo,
+                            CUDNN_CONVOLUTION_FWD_ALGO_GEMM,
+                            /* void *workSpace */d_workspace,
+                            /* size_t workSpaceSizeInBytes */workspace_bytes,
+                            /* const void *beta */&beta,
+                            /* const cudnnTensorDescriptor_t yDesc */output_descriptor,
+                            /* void *y */d_output) );
+
+    cudaDeviceSynchronize();
+    float* h_output = new float[10 * 19 * 19];
+    cudaMemcpy(h_output, d_output, output_bytes, cudaMemcpyDeviceToHost);
+    // cudaStreamSynchronize(0);
+
+    // Do something with h_output ...
+    // for(int i=0;i<1 * 10 * 19 * 19;i++)
+    int index = 0;
+    for(int i =0;i<10;i++)
+    {
+        for(int j =0;j<19;j++)
+        {
+            // std::cout<<"[ "
+            for(int k=0;k<19;k++)
+            {
+
+                std::cout<<h_output[index]<<"\t";
+                index ++;
+            }
+            std::cout<<"\n";
+        }
+    }
+        // std::cout<<h_output[i]<<"\t";
+
+    std::cout<<std::endl;
+
+    delete[] h_output;
+    cudaFree(d_kernel);
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_workspace);
+
+    cudnnDestroyTensorDescriptor(input_descriptor);
+    cudnnDestroyTensorDescriptor(output_descriptor);
+    cudnnDestroyFilterDescriptor(kernel_descriptor);
+    cudnnDestroyConvolutionDescriptor(convolution_descriptor);
+
+    cudnnDestroy(cudnn);
+
+
+
+
     return 0;
 }
 
